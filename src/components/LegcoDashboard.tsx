@@ -20,6 +20,15 @@ import {
   Search,
   Trash2,
 } from "lucide-react";
+import {
+  decryptJsonWithPasscode,
+  type EncryptedSnapshotPayload,
+} from "../lib/static-crypto";
+import { getWorkingHoursStatus } from "../lib/working-hours";
+
+const STATIC_PASSCODE_KEY = "legco_static_passcode";
+const STATIC_WATCHLIST_KEY = "legco_static_watchlist";
+const STATIC_ACK_KEY = "legco_static_ack_at";
 
 type LangMode = "both" | "tc" | "en";
 type MainTab = "meetings" | "documents" | "questions" | "watchlist";
@@ -253,7 +262,8 @@ const DOC_TYPE_LABELS: Record<string, { en: string; tc: string; tone: string }> 
   },
 };
 
-export function LegcoDashboard() {
+export function LegcoDashboard({ mode = "server" }: { mode?: "server" | "static" }) {
+  const isStatic = mode === "static";
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
@@ -282,8 +292,66 @@ export function LegcoDashboard() {
   const [unlocking, setUnlocking] = useState(false);
   const [unlockError, setUnlockError] = useState<string | null>(null);
 
+  const loadStaticDashboard = useCallback(async (candidatePasscode?: string) => {
+    const res = await fetch(`./snapshot.enc.json?t=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) {
+      throw new Error("Encrypted LegCo snapshot not ready yet. Run or wait for the GitHub Action sync.");
+    }
+    const encPayload = (await res.json()) as EncryptedSnapshotPayload;
+    const savedPass =
+      candidatePasscode ?? window.sessionStorage.getItem(STATIC_PASSCODE_KEY) ?? "";
+    if (!savedPass) {
+      setPasscodeRequired(true);
+      setLoading(false);
+      return false;
+    }
+
+    const decrypted = await decryptJsonWithPasscode<DashboardData>(encPayload, savedPass);
+    const savedRules = JSON.parse(
+      window.localStorage.getItem(STATIC_WATCHLIST_KEY) || "[]",
+    ) as WatchlistRule[];
+    const ackIso = window.localStorage.getItem(STATIC_ACK_KEY) || "";
+    const ackMs = ackIso ? Date.parse(ackIso) : 0;
+    const unreadCount = decrypted.events.filter((ev) => {
+      const t = Date.parse(ev.detected_at);
+      return !Number.isNaN(t) && t > ackMs;
+    }).length;
+
+    window.sessionStorage.setItem(STATIC_PASSCODE_KEY, savedPass);
+    setPasscodeRequired(false);
+    setData({
+      ...decrypted,
+      watchlist: savedRules,
+      unreadCount,
+      workingHours: getWorkingHoursStatus(),
+      viewer: {
+        name: "Teammate",
+        simulated: false,
+        passcodeEnabled: true,
+      },
+    });
+    setError(null);
+    setLoading(false);
+    return true;
+  }, []);
+
   const fetchDashboard = useCallback(async () => {
     try {
+      if (isStatic) {
+        try {
+          await loadStaticDashboard();
+        } catch (err: unknown) {
+          if (window.sessionStorage.getItem(STATIC_PASSCODE_KEY)) {
+            window.sessionStorage.removeItem(STATIC_PASSCODE_KEY);
+            setPasscodeRequired(true);
+            setLoading(false);
+            return;
+          }
+          throw err;
+        }
+        return;
+      }
+
       const res = await fetch("/api/dashboard", { cache: "no-store" });
       if (res.status === 401) {
         const errBody = (await res.json().catch(() => ({}))) as {
@@ -315,7 +383,7 @@ export function LegcoDashboard() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [isStatic, loadStaticDashboard]);
 
   const handleUnlock = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -323,6 +391,16 @@ export function LegcoDashboard() {
     setUnlocking(true);
     setUnlockError(null);
     try {
+      if (isStatic) {
+        try {
+          await loadStaticDashboard(passcodeInput.trim());
+          setPasscodeInput("");
+        } catch {
+          setUnlockError("Incorrect passcode");
+        }
+        return;
+      }
+
       const res = await fetch("/api/auth/unlock", {
         method: "POST",
         headers: {
@@ -345,6 +423,13 @@ export function LegcoDashboard() {
   };
 
   const handleLock = async () => {
+    if (isStatic) {
+      window.sessionStorage.removeItem(STATIC_PASSCODE_KEY);
+      setData(null);
+      setPasscodeRequired(true);
+      return;
+    }
+
     await fetch("/api/auth/logout", {
       method: "POST",
       headers: { "x-legco-client": "1" },
@@ -369,6 +454,11 @@ export function LegcoDashboard() {
   const handleManualSync = async () => {
     setSyncing(true);
     try {
+      if (isStatic) {
+        await fetchDashboard();
+        return;
+      }
+
       const res = await fetch("/api/sync", {
         method: "POST",
         headers: { "x-legco-client": "1" },
@@ -383,6 +473,12 @@ export function LegcoDashboard() {
   };
 
   const handleAckEvents = async () => {
+    if (isStatic) {
+      window.localStorage.setItem(STATIC_ACK_KEY, new Date().toISOString());
+      await fetchDashboard();
+      return;
+    }
+
     await fetch("/api/events/ack", {
       method: "POST",
       headers: { "x-legco-client": "1" },
@@ -397,6 +493,27 @@ export function LegcoDashboard() {
   ) => {
     const trimmed = value.trim();
     if (trimmed.length < 2) return;
+
+    if (isStatic) {
+      const existing = JSON.parse(
+        window.localStorage.getItem(STATIC_WATCHLIST_KEY) || "[]",
+      ) as WatchlistRule[];
+      const next: WatchlistRule[] = [
+        {
+          id: Date.now(),
+          rule_type: ruleType,
+          value: trimmed,
+          label: (label || trimmed).slice(0, 140),
+          created_at: new Date().toISOString(),
+        },
+        ...existing.filter((r) => !(r.rule_type === ruleType && r.value === trimmed)),
+      ];
+      window.localStorage.setItem(STATIC_WATCHLIST_KEY, JSON.stringify(next));
+      setNewRuleValue("");
+      await fetchDashboard();
+      return;
+    }
+
     await fetch("/api/watchlist", {
       method: "POST",
       headers: {
@@ -410,6 +527,16 @@ export function LegcoDashboard() {
   };
 
   const handleDeleteWatchRule = async (id: number) => {
+    if (isStatic) {
+      const existing = JSON.parse(
+        window.localStorage.getItem(STATIC_WATCHLIST_KEY) || "[]",
+      ) as WatchlistRule[];
+      const next = existing.filter((r) => r.id !== id);
+      window.localStorage.setItem(STATIC_WATCHLIST_KEY, JSON.stringify(next));
+      await fetchDashboard();
+      return;
+    }
+
     await fetch(`/api/watchlist?id=${id}`, {
       method: "DELETE",
       headers: { "x-legco-client": "1" },

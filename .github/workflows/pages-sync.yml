@@ -1,0 +1,64 @@
+name: Sync LegCo & Deploy GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+  schedule:
+    # 08:00-20:00 HKT (Mon-Sat) = 00:00-12:00 UTC
+    - cron: "*/10 0-11 * * 1-6"
+    - cron: "0 12 * * 1-6"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build-and-sync:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync LegCo Open Data & encrypt snapshot
+        env:
+          APP_PASSCODE: ${{ secrets.APP_PASSCODE }}
+          PREV_STATE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/state.enc.json
+        run: |
+          if [ -z "$APP_PASSCODE" ]; then
+            echo "ERROR: Set APP_PASSCODE in Repository Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          npm run sync:pages
+
+      - name: Build static Pages UI
+        run: npm run build:pages
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./dist-pages
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
