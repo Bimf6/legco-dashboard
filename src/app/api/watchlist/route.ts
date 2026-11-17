@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { requireIdentity } from "../../../../cursor/identity";
+import { authorizeRequest } from "@/lib/access-gate";
 import { sql } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
@@ -7,8 +7,8 @@ export const dynamic = "force-dynamic";
 const ALLOWED_TYPES = new Set(["committee", "keyword", "member"]);
 
 export async function POST(request: Request) {
-  const identity = await requireIdentity(request);
-  if (identity instanceof Response) return identity;
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) return auth.response;
 
   if (request.headers.get("x-legco-client") !== "1") {
     return NextResponse.json({ error: "Invalid request origin" }, { status: 403 });
@@ -33,7 +33,7 @@ export async function POST(request: Request) {
      values ($1, $2, $3, $4)
      on conflict (viewer_sub, rule_type, value) do update set label = excluded.label
      returning id, rule_type, value, label, created_at`,
-    [identity.sub, ruleType, value, label.slice(0, 140)],
+    [auth.viewerSub, ruleType, value, label.slice(0, 140)],
   );
 
   return NextResponse.json(
@@ -43,8 +43,8 @@ export async function POST(request: Request) {
 }
 
 export async function DELETE(request: Request) {
-  const identity = await requireIdentity(request);
-  if (identity instanceof Response) return identity;
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) return auth.response;
 
   if (request.headers.get("x-legco-client") !== "1") {
     return NextResponse.json({ error: "Invalid request origin" }, { status: 403 });
@@ -58,7 +58,7 @@ export async function DELETE(request: Request) {
 
   await sql("delete from watchlist_rules where id = $1 and viewer_sub = $2", [
     id,
-    identity.sub,
+    auth.viewerSub,
   ]);
 
   return NextResponse.json({ ok: true }, { headers: { "cache-control": "private, no-store" } });

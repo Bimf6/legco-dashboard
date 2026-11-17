@@ -13,6 +13,7 @@ import {
   ExternalLink,
   FileText,
   Filter,
+  Lock,
   MessageSquare,
   Plus,
   RefreshCw,
@@ -165,6 +166,7 @@ interface DashboardData {
   viewer: {
     name: string;
     simulated: boolean;
+    passcodeEnabled?: boolean;
   };
 }
 
@@ -275,11 +277,29 @@ export function LegcoDashboard() {
   const [newRuleType, setNewRuleType] = useState<"committee" | "keyword" | "member">("keyword");
   const [newRuleValue, setNewRuleValue] = useState("");
 
+  const [passcodeRequired, setPasscodeRequired] = useState(false);
+  const [passcodeInput, setPasscodeInput] = useState("");
+  const [unlocking, setUnlocking] = useState(false);
+  const [unlockError, setUnlockError] = useState<string | null>(null);
+
   const fetchDashboard = useCallback(async () => {
     try {
       const res = await fetch("/api/dashboard", { cache: "no-store" });
       if (res.status === 401) {
-        setError("Sign-in required to view this dashboard.");
+        const errBody = (await res.json().catch(() => ({}))) as {
+          reason?: string;
+          error?: string;
+        };
+        if (errBody.reason === "passcode_required") {
+          setPasscodeRequired(true);
+          setError(null);
+        } else {
+          setPasscodeRequired(false);
+          setError(
+            errBody.error ||
+              "Sign-in required to view this dashboard.",
+          );
+        }
         setLoading(false);
         return;
       }
@@ -287,6 +307,7 @@ export function LegcoDashboard() {
         throw new Error(`HTTP ${res.status}`);
       }
       const json = (await res.json()) as DashboardData;
+      setPasscodeRequired(false);
       setData(json);
       setError(null);
     } catch (err: unknown) {
@@ -295,6 +316,42 @@ export function LegcoDashboard() {
       setLoading(false);
     }
   }, []);
+
+  const handleUnlock = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!passcodeInput.trim()) return;
+    setUnlocking(true);
+    setUnlockError(null);
+    try {
+      const res = await fetch("/api/auth/unlock", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-legco-client": "1",
+        },
+        body: JSON.stringify({ passcode: passcodeInput }),
+      });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        setUnlockError(body.error || "Incorrect passcode");
+        return;
+      }
+      setPasscodeInput("");
+      setLoading(true);
+      await fetchDashboard();
+    } finally {
+      setUnlocking(false);
+    }
+  };
+
+  const handleLock = async () => {
+    await fetch("/api/auth/logout", {
+      method: "POST",
+      headers: { "x-legco-client": "1" },
+    });
+    setData(null);
+    setPasscodeRequired(true);
+  };
 
   useEffect(() => {
     void fetchDashboard();
@@ -457,6 +514,58 @@ export function LegcoDashboard() {
     );
   }
 
+  if (passcodeRequired) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 p-6">
+        <form
+          onSubmit={handleUnlock}
+          className="max-w-sm w-full bg-white border border-slate-200 rounded-xl p-6 space-y-4"
+        >
+          <div className="flex items-center gap-2.5">
+            <div className="w-9 h-9 rounded-lg bg-slate-900 text-white flex items-center justify-center">
+              <Lock className="w-4 h-4" />
+            </div>
+            <div>
+              <h1 className="text-sm font-semibold text-slate-900">
+                LegCo Monitor · 立法會監察儀表板
+              </h1>
+              <p className="text-xs text-slate-500">Team access passcode required</p>
+            </div>
+          </div>
+
+          {unlockError && (
+            <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
+              {unlockError}
+            </div>
+          )}
+
+          <div className="space-y-1.5">
+            <label htmlFor="legco-passcode" className="block text-xs font-medium text-slate-700">
+              Passcode · 存取密碼
+            </label>
+            <input
+              id="legco-passcode"
+              type="password"
+              autoFocus
+              value={passcodeInput}
+              onChange={(e) => setPasscodeInput(e.target.value)}
+              placeholder="Enter team passcode"
+              className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-500"
+            />
+          </div>
+
+          <button
+            type="submit"
+            disabled={unlocking || !passcodeInput.trim()}
+            className="w-full py-2 px-4 rounded-lg bg-slate-900 text-white text-xs font-medium hover:bg-slate-800 disabled:opacity-50 transition cursor-pointer"
+          >
+            {unlocking ? "Verifying…" : "Unlock Dashboard · 進入儀表板"}
+          </button>
+        </form>
+      </div>
+    );
+  }
+
   if (error && !data) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-50 p-6">
@@ -538,6 +647,17 @@ export function LegcoDashboard() {
                 <RefreshCw className={`w-3.5 h-3.5 ${syncing ? "animate-spin" : ""}`} />
                 {syncing ? "Syncing…" : "Sync Now"}
               </button>
+
+              {data.viewer.passcodeEnabled && (
+                <button
+                  onClick={handleLock}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-slate-700 text-xs font-medium hover:bg-slate-50 cursor-pointer"
+                  title="Lock dashboard"
+                >
+                  <Lock className="w-3.5 h-3.5" />
+                  <span>Lock</span>
+                </button>
+              )}
             </div>
           </div>
 

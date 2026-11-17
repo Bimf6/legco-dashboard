@@ -1,13 +1,13 @@
 import { NextResponse } from "next/server";
-import { requireIdentity } from "../../../../cursor/identity";
+import { authorizeRequest } from "@/lib/access-gate";
 import { sql } from "@/lib/db";
 import { runLegcoSync } from "@/lib/legco-sync";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
-  const identity = await requireIdentity(request);
-  if (identity instanceof Response) return identity;
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) return auth.response;
 
   if (request.headers.get("x-legco-client") !== "1") {
     return NextResponse.json({ error: "Invalid request origin" }, { status: 403 });

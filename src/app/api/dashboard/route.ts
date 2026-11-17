@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { requireIdentity } from "../../../../cursor/identity";
+import { authorizeRequest } from "@/lib/access-gate";
 import { sql } from "@/lib/db";
 import { ensureFreshDataIfDue } from "@/lib/legco-sync";
 import { getWorkingHoursStatus } from "@/lib/working-hours";
@@ -7,8 +7,8 @@ import { getWorkingHoursStatus } from "@/lib/working-hours";
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
-  const identity = await requireIdentity(request);
-  if (identity instanceof Response) return identity;
+  const auth = await authorizeRequest(request);
+  if (!auth.authorized) return auth.response;
 
   await ensureFreshDataIfDue();
 
@@ -55,7 +55,7 @@ export async function GET(request: Request) {
          from watchlist_rules
          where viewer_sub = $1
          order by created_at desc`,
-        [identity.sub],
+        [auth.viewerSub],
       ),
       sql(
         `select last_sync_at, last_success_at, last_mode, last_summary_json, last_error, is_syncing
@@ -63,7 +63,7 @@ export async function GET(request: Request) {
       ),
       sql<{ last_ack_at: string }>(
         "select last_ack_at from viewer_ack_state where viewer_sub = $1",
-        [identity.sub],
+        [auth.viewerSub],
       ),
     ]);
 
@@ -84,8 +84,9 @@ export async function GET(request: Request) {
       syncState: syncRows[0] ?? null,
       workingHours: getWorkingHoursStatus(),
       viewer: {
-        name: identity.kind === "person" ? identity.name || identity.email : identity.name,
-        simulated: Boolean(identity.simulated),
+        name: auth.viewerName,
+        simulated: auth.simulated,
+        passcodeEnabled: auth.passcodeEnabled,
       },
     },
     {
