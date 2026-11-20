@@ -134,6 +134,8 @@ interface QuestionRow {
   agenda_url_tc: string | null;
   hansard_url_en: string | null;
   hansard_url_tc: string | null;
+  reply_url_en?: string | null;
+  reply_url_tc?: string | null;
 }
 
 interface WatchlistRule {
@@ -185,7 +187,9 @@ function safeLegcoHref(raw: string | null | undefined): string | null {
     const u = new URL(raw);
     if (
       u.protocol === "https:" &&
-      (u.hostname === "www.legco.gov.hk" || u.hostname === "app.legco.gov.hk")
+      (u.hostname === "www.legco.gov.hk" ||
+        u.hostname === "app.legco.gov.hk" ||
+        u.hostname === "www.info.gov.hk")
     ) {
       return u.toString();
     }
@@ -1417,8 +1421,34 @@ export function LegcoDashboard({ mode = "server" }: { mode?: "server" | "static"
             <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-100">
               {filteredQuestions.map((q) => {
                 const isOpen = Boolean(expandedQuestions[q.question_key]);
-                const linkEn = safeLegcoHref(q.stage === "upcoming" ? q.agenda_url_en : q.hansard_url_en);
-                const linkTc = safeLegcoHref(q.stage === "upcoming" ? q.agenda_url_tc : q.hansard_url_tc);
+                const agendaEn = safeLegcoHref(q.agenda_url_en);
+                const agendaTc = safeLegcoHref(q.agenda_url_tc);
+                const hansardEn = safeLegcoHref(q.hansard_url_en);
+                const hansardTc = safeLegcoHref(q.hansard_url_tc);
+                const replyEn = safeLegcoHref(q.reply_url_en);
+                const replyTc = safeLegcoHref(q.reply_url_tc);
+                const linkEn = q.stage === "upcoming" ? agendaEn : hansardEn || replyEn || agendaEn;
+                const linkTc = q.stage === "upcoming" ? agendaTc : hansardTc || replyTc || agendaTc;
+                const linkLabelEn =
+                  q.stage === "upcoming"
+                    ? q.agenda_url_en?.includes("#q_")
+                      ? "EN Agenda"
+                      : "EN Questions"
+                    : hansardEn
+                      ? "EN Hansard"
+                      : replyEn
+                        ? "EN Reply"
+                        : "EN Questions";
+                const linkLabelTc =
+                  q.stage === "upcoming"
+                    ? q.agenda_url_tc?.includes("#q_")
+                      ? "繁中議程"
+                      : "繁中質詢"
+                    : hansardTc
+                      ? "繁中 Hansard"
+                      : replyTc
+                        ? "繁中回覆"
+                        : "繁中質詢";
 
                 return (
                   <div key={q.id} className="p-3.5 space-y-2">
@@ -1432,7 +1462,11 @@ export function LegcoDashboard({ mode = "server" }: { mode?: "server" | "static"
                                 : "bg-emerald-50 text-emerald-700 border-emerald-200"
                             }`}
                           >
-                            {q.stage === "upcoming" ? "Upcoming Agenda" : "Hansard Answered"}
+                            {q.stage === "upcoming"
+                              ? "Upcoming Agenda"
+                              : hansardEn || hansardTc
+                                ? "Hansard Answered"
+                                : "Govt Reply Live"}
                           </span>
                           <span
                             className={`px-2 py-0.5 rounded-full border font-medium ${
@@ -1476,7 +1510,7 @@ export function LegcoDashboard({ mode = "server" }: { mode?: "server" | "static"
                             rel="noopener noreferrer"
                             className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-200 bg-white text-slate-700 hover:border-indigo-300 font-medium"
                           >
-                            <span>{q.stage === "upcoming" ? "繁中議程" : "繁中 Hansard"}</span>
+                            <span>{linkLabelTc}</span>
                             <ExternalLink className="w-3 h-3" />
                           </a>
                         )}
@@ -1487,7 +1521,7 @@ export function LegcoDashboard({ mode = "server" }: { mode?: "server" | "static"
                             rel="noopener noreferrer"
                             className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-200 bg-white text-slate-700 hover:border-indigo-300 font-medium"
                           >
-                            <span>{q.stage === "upcoming" ? "EN Agenda" : "EN Hansard"}</span>
+                            <span>{linkLabelEn}</span>
                             <ExternalLink className="w-3 h-3" />
                           </a>
                         )}
@@ -1495,7 +1529,7 @@ export function LegcoDashboard({ mode = "server" }: { mode?: "server" | "static"
                     </div>
 
                     {isOpen && (q.body_en || q.body_tc) && (
-                      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs text-slate-700 space-y-2 leading-relaxed">
+                      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs text-slate-700 space-y-2 leading-relaxed whitespace-pre-line">
                         {q.body_tc && (lang === "both" || lang === "tc") && <p>{q.body_tc}</p>}
                         {q.body_en && (lang === "both" || lang === "en") && <p>{q.body_en}</p>}
                       </div>

@@ -43,6 +43,40 @@ export interface ParsedCouncilQuestion {
   contentHash: string;
 }
 
+export interface LegcoQuestionJsonItem {
+  ID?: number;
+  MeetingDate?: string;
+  Session?: string;
+  Lang?: string;
+  SeqNo?: number;
+  Type?: string;
+  Member?: string;
+  ReplyOfficer?: string[];
+  Subject?: string;
+  Content?: string;
+  ReplyURL?: string | null;
+  Hidden?: string;
+}
+
+export interface ParsedPortalQuestion {
+  questionKey: string;
+  stage: "upcoming" | "answered";
+  questionType: "oral" | "written";
+  questionNo: number;
+  meetingDate: string;
+  memberNameEn: string;
+  memberNameTc: string;
+  subjectEn: string;
+  subjectTc: string;
+  bodyEn: string;
+  bodyTc: string;
+  agendaUrlEn: string;
+  agendaUrlTc: string;
+  replyUrlEn: string;
+  replyUrlTc: string;
+  contentHash: string;
+}
+
 export interface AgendaDiffEvent {
   eventType:
     | "AGENDA_PUBLISHED"
@@ -125,12 +159,16 @@ export function parseCommitteeAgendaHtml(html: string): ParsedAgenda {
       if (tds.length === 0) return;
 
       const firstCellText = cleanText(tds.eq(0).text());
+      const col2Text = tds.length >= 3 ? cleanText(tds.eq(2).text()) : "";
+      const col3Text = tds.length >= 4 ? cleanText(tds.eq(3).text()) : "";
       const lastCellText =
-        tds.length >= 3
-          ? cleanText(tds.eq(2).text())
-          : tds.length === 2
-            ? cleanText(tds.eq(1).text())
-            : "";
+        tds.length >= 4 && col2Text === ":"
+          ? [cleanText(tds.eq(1).text()), col3Text].filter(Boolean).join(" — ")
+          : tds.length >= 3
+            ? col2Text
+            : tds.length === 2
+              ? cleanText(tds.eq(1).text())
+              : "";
       const fullRowText = cleanText($(tr).text());
 
       let href = "";
@@ -288,6 +326,127 @@ export function parseCouncilQuestionsFromAgenda(html: string): ParsedCouncilQues
       contentHash,
     });
   });
+
+  return results;
+}
+
+function formatQuestionContentHtml(rawHtml: string | undefined): string {
+  if (!rawHtml) return "";
+  const withMarkers = rawHtml
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/div>\s*<div[^>]*style="width:\s*94%[^"]*"[^>]*>/gi, " ")
+    .replace(/<\/?(?:div|p|li|tr)[^>]*>/gi, "\n");
+  const text = cheerio.load(`<div>${withMarkers}</div>`).text();
+  return text
+    .replace(/\u00a0/g, " ")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+/g, " ").trim())
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function isPlaceholderQuestionSubject(subject: string, bodyText: string): boolean {
+  const s = cleanText(subject).toLowerCase();
+  const b = cleanText(bodyText).toLowerCase();
+  const isTbc = (val: string) =>
+    !val ||
+    val === "to be confirmed" ||
+    val === "有待確定" ||
+    val === "待定" ||
+    val === "tbd";
+  return isTbc(s) && (b.length < 10 || isTbc(b));
+}
+
+export function parseCouncilQuestionsPortalJson(
+  enItems: LegcoQuestionJsonItem[],
+  tcItems: LegcoQuestionJsonItem[],
+  sessionYear: string,
+  hktIsoDate: string,
+): ParsedPortalQuestion[] {
+  const tcByDateSeq = new Map<string, LegcoQuestionJsonItem>();
+  for (const item of tcItems) {
+    const mDate = cleanText(item.MeetingDate || "").slice(0, 10);
+    const seqNo = Number(item.SeqNo ?? 0);
+    if (mDate && seqNo > 0) {
+      tcByDateSeq.set(`${mDate}|${seqNo}`, item);
+    }
+  }
+
+  const results: ParsedPortalQuestion[] = [];
+  const seenKeys = new Set<string>();
+
+  for (const en of enItems) {
+    const meetingDate = cleanText(en.MeetingDate || "").slice(0, 10);
+    const questionNo = Number(en.SeqNo ?? 0);
+    if (!meetingDate || questionNo <= 0) continue;
+
+    const key = `${meetingDate}|${questionNo}`;
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+
+    const tc = tcByDateSeq.get(key);
+    const bodyEn = formatQuestionContentHtml(en.Content);
+    const bodyTc = formatQuestionContentHtml(tc?.Content);
+    const subjectEn = cleanText(en.Subject || "");
+    const subjectTc = cleanText(tc?.Subject || "");
+
+    if (
+      isPlaceholderQuestionSubject(subjectEn, bodyEn) &&
+      isPlaceholderQuestionSubject(subjectTc, bodyTc)
+    ) {
+      continue;
+    }
+
+    const hiddenEn = en.Hidden === "Y";
+    const hiddenTc = tc?.Hidden === "Y";
+    const replyUrlEn = !hiddenEn && en.ReplyURL ? cleanText(en.ReplyURL) : "";
+    const replyUrlTc = !hiddenTc && tc?.ReplyURL ? cleanText(tc.ReplyURL) : "";
+
+    const typeText = `${en.Type || ""} ${tc?.Type || ""}`;
+    const questionType: "oral" | "written" = /written|書面/i.test(typeText)
+      ? "written"
+      : "oral";
+
+    const stage: "upcoming" | "answered" =
+      meetingDate < hktIsoDate && (Boolean(replyUrlEn) || Boolean(replyUrlTc))
+        ? "answered"
+        : "upcoming";
+
+    const memberNameEn = cleanText(en.Member || tc?.Member || "");
+    const memberNameTc = cleanText(tc?.Member || en.Member || "");
+    const finalSubjectEn = subjectEn || subjectTc;
+    const finalSubjectTc = subjectTc || subjectEn;
+
+    const agendaUrlEn = `https://www.legco.gov.hk/en/legco-business/council/questions.html?${encodeURIComponent(sessionYear)}&d=${encodeURIComponent(meetingDate)}`;
+    const agendaUrlTc = `https://www.legco.gov.hk/tc/legco-business/council/questions.html?${encodeURIComponent(sessionYear)}&d=${encodeURIComponent(meetingDate)}`;
+
+    const contentHash = crypto
+      .createHash("sha256")
+      .update(
+        `${meetingDate}|${questionNo}|${questionType}|${memberNameEn}|${finalSubjectEn}|${finalSubjectTc}|${bodyEn}|${replyUrlEn}`,
+      )
+      .digest("hex")
+      .slice(0, 16);
+
+    results.push({
+      questionKey: `${meetingDate}:Q${questionNo}`,
+      stage,
+      questionType,
+      questionNo,
+      meetingDate,
+      memberNameEn,
+      memberNameTc,
+      subjectEn: finalSubjectEn,
+      subjectTc: finalSubjectTc,
+      bodyEn,
+      bodyTc,
+      agendaUrlEn,
+      agendaUrlTc,
+      replyUrlEn,
+      replyUrlTc,
+      contentHash,
+    });
+  }
 
   return results;
 }

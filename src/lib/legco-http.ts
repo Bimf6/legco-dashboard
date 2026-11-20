@@ -94,5 +94,6 @@ export async function fetchLegcoJson<T>(rawUrl: string, timeoutMs = 18000): Prom
   if (res.body.trimStart().startsWith("<!DOCTYPE html") || res.body.includes('data-unit="page-not-found"')) {
     throw new Error(`LegCo returned HTML 404 page for ${rawUrl}`);
   }
-  return JSON.parse(res.body) as T;
+  const cleanBody = res.body.replace(/^\uFEFF/, "");
+  return JSON.parse(cleanBody) as T;
 }

@@ -13,6 +13,14 @@ interface PersistedState {
   meetings: Array<Record<string, unknown>>;
   events: Array<Record<string, unknown>>;
   docKeys: string[];
+  questionStates?: Array<{
+    question_key: string;
+    stage: string;
+    question_type: string;
+    question_no: number | null;
+    meeting_date: string;
+    content_hash: string | null;
+  }>;
 }
 
 async function restorePreviousState(passcode: string, stateFilePath: string): Promise<void> {
@@ -126,8 +134,26 @@ async function restorePreviousState(passcode: string, stateFilePath: string): Pr
     );
   }
 
+  for (const q of state.questionStates || []) {
+    await sql(
+      `insert into questions (
+        question_key, stage, question_type, question_no, meeting_date,
+        member_name_en, member_name_tc, subject_en, subject_tc, content_hash
+      ) values ($1, $2, $3, $4, $5, '', '', '', '', $6)
+      on conflict (question_key) do nothing`,
+      [
+        q.question_key,
+        q.stage,
+        q.question_type,
+        q.question_no,
+        q.meeting_date,
+        q.content_hash,
+      ],
+    );
+  }
+
   console.log(
-    `pages-sync: restored ${state.meetings?.length ?? 0} meetings, ${state.docKeys?.length ?? 0} doc keys, and ${state.events?.length ?? 0} events for diffing.`,
+    `pages-sync: restored ${state.meetings?.length ?? 0} meetings, ${state.docKeys?.length ?? 0} doc keys, ${state.questionStates?.length ?? 0} question states, and ${state.events?.length ?? 0} events for diffing.`,
   );
 }
 
@@ -147,7 +173,7 @@ async function main() {
 
   const summary = await runLegcoSync("auto");
 
-  const [meetings, events, documents, allDocKeys, questions, syncRows] = await Promise.all([
+  const [meetings, events, documents, allDocKeys, questions, questionStates, syncRows] = await Promise.all([
     sql(
       `select meet_id, slot_id, committee_code, committee_name_en, committee_name_tc,
               subject_en, subject_tc, start_date_time, venue_code, venue_name_en,
@@ -179,11 +205,16 @@ async function main() {
       `select id, question_key, stage, question_type, question_no, meeting_date,
               member_name_en, member_name_tc, subject_en, subject_tc,
               body_en, body_tc, agenda_url_en, agenda_url_tc,
-              hansard_url_en, hansard_url_tc, updated_at
+              hansard_url_en, hansard_url_tc, reply_url_en, reply_url_tc, updated_at
        from questions
        order by case when stage = 'upcoming' then 0 else 1 end asc,
+                case when stage = 'upcoming' then meeting_date end asc,
                 meeting_date desc, question_no asc nulls last
-       limit 120`,
+       limit 160`,
+    ),
+    sql(
+      `select question_key, stage, question_type, question_no, meeting_date, content_hash
+       from questions`,
     ),
     sql(
       `select last_sync_at, last_success_at, last_mode, last_summary_json, last_error, is_syncing
@@ -209,7 +240,7 @@ async function main() {
 
   const encryptedSnapshot = await encryptJsonWithPasscode(dashboardPayload, passcode);
   const encryptedState = await encryptJsonWithPasscode(
-    { meetings, events, docKeys: allDocKeys.map((r) => r.doc_key) },
+    { meetings, events, docKeys: allDocKeys.map((r) => r.doc_key), questionStates },
     passcode,
   );
 

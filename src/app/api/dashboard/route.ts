@@ -44,11 +44,12 @@ export async function GET(request: Request) {
         `select id, question_key, stage, question_type, question_no, meeting_date,
                 member_name_en, member_name_tc, subject_en, subject_tc,
                 body_en, body_tc, agenda_url_en, agenda_url_tc,
-                hansard_url_en, hansard_url_tc, updated_at
+                hansard_url_en, hansard_url_tc, reply_url_en, reply_url_tc, updated_at
          from questions
          order by case when stage = 'upcoming' then 0 else 1 end asc,
+                  case when stage = 'upcoming' then meeting_date end asc,
                   meeting_date desc, question_no asc nulls last
-         limit 120`,
+         limit 160`,
       ),
       sql(
         `select id, rule_type, value, label, created_at

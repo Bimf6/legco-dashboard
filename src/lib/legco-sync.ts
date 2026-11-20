@@ -1,10 +1,13 @@
+import crypto from "node:crypto";
 import { sql } from "./db";
 import { fetchLegcoJson, fetchLegcoText, normalizeLegcoUrl } from "./legco-http";
 import {
   AgendaItem,
   diffAgendaItems,
+  LegcoQuestionJsonItem,
   parseCommitteeAgendaHtml,
   parseCouncilQuestionsFromAgenda,
+  parseCouncilQuestionsPortalJson,
 } from "./parsers/agenda-parser";
 import {
   harvestCommitteeBiPapers,
@@ -293,6 +296,17 @@ async function executeSync(trigger: "auto" | "manual"): Promise<SyncSummary> {
        from meetings`,
     );
 
+    const existingQuestions = await sql<{
+      question_key: string;
+      meeting_date: string;
+      stage: string;
+      content_hash: string | null;
+    }>("select question_key, meeting_date, stage, content_hash from questions");
+    const existingQuestionMap = new Map(
+      existingQuestions.map((q) => [q.question_key, q]),
+    );
+    const hasBaselineQuestions = existingQuestions.some((q) => q.stage === "upcoming");
+
     const isBootstrap = existingMeetings.length === 0;
     const existingById = new Map(existingMeetings.map((m) => [Number(m.meet_id), m]));
 
@@ -516,13 +530,19 @@ async function executeSync(trigger: "auto" | "manual"): Promise<SyncSummary> {
       }
     }
 
-    // 2. Probe Agendas (for meetings within probeFrom..probeTo)
+    // 2. Probe Agendas (for meetings within probeFrom..probeTo; Council meetings first)
     const meetingsToProbe = (meetingsRes.value || [])
       .filter((m) => {
         const d = m.start_date_time.slice(0, 10);
         return m.agenda_url_eng && d >= probeFrom && d <= probeTo;
       })
-      .slice(0, 26);
+      .sort((a, b) => {
+        const aIsCouncil = a.agenda_url_eng?.includes("/counmtg/agenda/cm") ? 0 : 1;
+        const bIsCouncil = b.agenda_url_eng?.includes("/counmtg/agenda/cm") ? 0 : 1;
+        if (aIsCouncil !== bIsCouncil) return aIsCouncil - bIsCouncil;
+        return a.start_date_time.localeCompare(b.start_date_time);
+      })
+      .slice(0, 34);
 
     const probedCouncilDates = new Set<string>();
 
@@ -690,13 +710,14 @@ async function executeSync(trigger: "auto" | "manual"): Promise<SyncSummary> {
                 for (const eq of enQuestions) {
                   const tq = tcByNo.get(eq.questionNo);
                   const qKey = `${cmDate}:Q${eq.questionNo}`;
+                  const initialStage = cmDate >= hkt.isoDate ? "upcoming" : "upcoming";
                   await sql(
                     `insert into questions (
                       question_key, stage, question_type, question_no, meeting_date,
                       member_name_en, member_name_tc, subject_en, subject_tc,
                       body_en, body_tc, agenda_url_en, agenda_url_tc, content_hash, updated_at
                     ) values (
-                      $1, 'upcoming', $2, $3, $4,
+                      $1, $14, $2, $3, $4,
                       $5, $6, $7, $8,
                       $9, $10, $11, $12, $13, now()
                     )
@@ -705,8 +726,8 @@ async function executeSync(trigger: "auto" | "manual"): Promise<SyncSummary> {
                       member_name_tc = excluded.member_name_tc,
                       subject_en = excluded.subject_en,
                       subject_tc = excluded.subject_tc,
-                      body_en = excluded.body_en,
-                      body_tc = excluded.body_tc,
+                      body_en = coalesce(nullif(excluded.body_en, ''), questions.body_en),
+                      body_tc = coalesce(nullif(excluded.body_tc, ''), questions.body_tc),
                       agenda_url_en = excluded.agenda_url_en,
                       agenda_url_tc = excluded.agenda_url_tc,
                       content_hash = excluded.content_hash,
@@ -725,6 +746,7 @@ async function executeSync(trigger: "auto" | "manual"): Promise<SyncSummary> {
                       `${agendaEn}#q_${eq.questionNo}`,
                       agendaTc ? `${agendaTc}#q_${eq.questionNo}` : "",
                       eq.contentHash,
+                      initialStage,
                     ],
                   );
                   questionsUpserted += 1;
@@ -834,8 +856,9 @@ async function executeSync(trigger: "auto" | "manual"): Promise<SyncSummary> {
       }
     }
 
-    // 5. Fetch QuestionsDB (Stage 2: Answered Oral & Written 質詢 with Hansard links)
-    const [oralEn, oralChi, writtenEn, writtenChi] = await Promise.all([
+    // 5. Fetch QuestionsDB (Hansard) + /bi/data/council/questions/ (Upcoming & Recent Replies)
+    const sessionYear = hkt.isoDate.slice(0, 4);
+    const [oralEn, oralChi, writtenEn, writtenChi, portalEn, portalTc] = await Promise.all([
       fetchLegcoJson<ODataList<QuestionDbRow>>(
         "https://app.legco.gov.hk/QuestionsDB/odata/ViewOralQuestionsEng?$top=30&$orderby=MeetingDate%20desc&$format=json",
       ).catch(() => ({ value: [] as QuestionDbRow[] })),
@@ -848,7 +871,24 @@ async function executeSync(trigger: "auto" | "manual"): Promise<SyncSummary> {
       fetchLegcoJson<ODataList<QuestionDbRow>>(
         "https://app.legco.gov.hk/QuestionsDB/odata/ViewWrittenQuestionsChi?$top=35&$orderby=MeetingDate%20desc&$format=json",
       ).catch(() => ({ value: [] as QuestionDbRow[] })),
+      fetchLegcoJson<LegcoQuestionJsonItem[]>(
+        `https://www.legco.gov.hk/bi/data/council/questions/en/${sessionYear}.json`,
+      ).catch(() => [] as LegcoQuestionJsonItem[]),
+      fetchLegcoJson<LegcoQuestionJsonItem[]>(
+        `https://www.legco.gov.hk/bi/data/council/questions/tc/${sessionYear}.json`,
+      ).catch(() => [] as LegcoQuestionJsonItem[]),
     ]);
+
+    const portalQuestions = parseCouncilQuestionsPortalJson(
+      Array.isArray(portalEn) ? portalEn : [],
+      Array.isArray(portalTc) ? portalTc : [],
+      sessionYear,
+      hkt.isoDate,
+    );
+    const portalByDateNo = new Map(
+      portalQuestions.map((q) => [`${q.meetingDate}|${q.questionNo}`, q]),
+    );
+    const dbAnsweredDates = new Set<string>();
 
     const pairQuestions = async (
       enList: QuestionDbRow[],
@@ -862,28 +902,38 @@ async function executeSync(trigger: "auto" | "manual"): Promise<SyncSummary> {
 
       for (const e of enList) {
         const mDate = e.MeetingDate.slice(0, 10);
+        dbAnsweredDates.add(mDate);
         const chi = chiByDateBookmark.get(`${mDate}|${e.BookmarkName}`);
         const qKey = `db:${qType}:${mDate}:${e.BookmarkName}`;
         const numMatch = e.BookmarkName.match(/(\d+)$/);
         const qNo = numMatch ? Number(numMatch[1]) : null;
+        const portalMatch = qNo ? portalByDateNo.get(`${mDate}|${qNo}`) : undefined;
 
         await sql(
           `insert into questions (
             question_key, stage, question_type, question_no, meeting_date,
             member_name_en, member_name_tc, subject_en, subject_tc,
-            hansard_url_en, hansard_url_tc, updated_at
+            body_en, body_tc, agenda_url_en, agenda_url_tc,
+            hansard_url_en, hansard_url_tc, reply_url_en, reply_url_tc, updated_at
           ) values (
             $1, 'answered', $2, $3, $4,
             $5, $6, $7, $8,
-            $9, $10, now()
+            $9, $10, $11, $12,
+            $13, $14, $15, $16, now()
           )
           on conflict (question_key) do update set
             member_name_en = excluded.member_name_en,
             member_name_tc = excluded.member_name_tc,
             subject_en = excluded.subject_en,
             subject_tc = excluded.subject_tc,
+            body_en = coalesce(nullif(excluded.body_en, ''), questions.body_en),
+            body_tc = coalesce(nullif(excluded.body_tc, ''), questions.body_tc),
+            agenda_url_en = coalesce(nullif(excluded.agenda_url_en, ''), questions.agenda_url_en),
+            agenda_url_tc = coalesce(nullif(excluded.agenda_url_tc, ''), questions.agenda_url_tc),
             hansard_url_en = excluded.hansard_url_en,
             hansard_url_tc = excluded.hansard_url_tc,
+            reply_url_en = coalesce(nullif(excluded.reply_url_en, ''), questions.reply_url_en),
+            reply_url_tc = coalesce(nullif(excluded.reply_url_tc, ''), questions.reply_url_tc),
             updated_at = now()`,
           [
             qKey,
@@ -894,8 +944,14 @@ async function executeSync(trigger: "auto" | "manual"): Promise<SyncSummary> {
             chi?.MemberName || e.MemberName,
             e.SubjectName,
             chi?.SubjectName || e.SubjectName,
+            portalMatch?.bodyEn || "",
+            portalMatch?.bodyTc || "",
+            portalMatch?.agendaUrlEn || "",
+            portalMatch?.agendaUrlTc || "",
             normalizeLegcoUrl(e.HansardFileURL),
             normalizeLegcoUrl(chi?.HansardFileURL || ""),
+            portalMatch?.replyUrlEn || "",
+            portalMatch?.replyUrlTc || "",
           ],
         );
         questionsUpserted += 1;
@@ -904,6 +960,115 @@ async function executeSync(trigger: "auto" | "manual"): Promise<SyncSummary> {
 
     await pairQuestions(oralEn.value || [], oralChi.value || [], "oral");
     await pairQuestions(writtenEn.value || [], writtenChi.value || [], "written");
+
+    // Remove stale upcoming/portal rows for dates already graduated into QuestionsDB Hansard
+    for (const answeredDate of dbAnsweredDates) {
+      await sql(
+        "delete from questions where meeting_date = $1 and question_key not like 'db:%'",
+        [answeredDate],
+      );
+    }
+
+    const portalCutoff = addDaysIso(hkt.isoDate, -30);
+    const updatedUpcomingByDate = new Map<
+      string,
+      { count: number; hashes: string[]; linkUrl: string }
+    >();
+
+    for (const q of portalQuestions) {
+      if (q.meetingDate < portalCutoff) continue;
+      if (dbAnsweredDates.has(q.meetingDate)) continue;
+
+      const prevQ = existingQuestionMap.get(q.questionKey);
+
+      await sql(
+        `insert into questions (
+          question_key, stage, question_type, question_no, meeting_date,
+          member_name_en, member_name_tc, subject_en, subject_tc,
+          body_en, body_tc, agenda_url_en, agenda_url_tc,
+          reply_url_en, reply_url_tc, content_hash, updated_at
+        ) values (
+          $1, $2, $3, $4, $5,
+          $6, $7, $8, $9,
+          $10, $11, $12, $13,
+          $14, $15, $16, now()
+        )
+        on conflict (question_key) do update set
+          stage = excluded.stage,
+          question_type = excluded.question_type,
+          member_name_en = excluded.member_name_en,
+          member_name_tc = excluded.member_name_tc,
+          subject_en = excluded.subject_en,
+          subject_tc = excluded.subject_tc,
+          body_en = coalesce(nullif(excluded.body_en, ''), questions.body_en),
+          body_tc = coalesce(nullif(excluded.body_tc, ''), questions.body_tc),
+          agenda_url_en = case
+            when questions.agenda_url_en like '%#q_%' then questions.agenda_url_en
+            else excluded.agenda_url_en
+          end,
+          agenda_url_tc = case
+            when questions.agenda_url_tc like '%#q_%' then questions.agenda_url_tc
+            else excluded.agenda_url_tc
+          end,
+          reply_url_en = coalesce(nullif(excluded.reply_url_en, ''), questions.reply_url_en),
+          reply_url_tc = coalesce(nullif(excluded.reply_url_tc, ''), questions.reply_url_tc),
+          content_hash = excluded.content_hash,
+          updated_at = now()`,
+        [
+          q.questionKey,
+          q.stage,
+          q.questionType,
+          q.questionNo,
+          q.meetingDate,
+          q.memberNameEn,
+          q.memberNameTc,
+          q.subjectEn,
+          q.subjectTc,
+          q.bodyEn,
+          q.bodyTc,
+          q.agendaUrlEn,
+          q.agendaUrlTc,
+          q.replyUrlEn,
+          q.replyUrlTc,
+          q.contentHash,
+        ],
+      );
+      questionsUpserted += 1;
+
+      if (q.stage === "upcoming" && hasBaselineQuestions && (!prevQ || prevQ.content_hash !== q.contentHash)) {
+        const entry = updatedUpcomingByDate.get(q.meetingDate) ?? {
+          count: 0,
+          hashes: [],
+          linkUrl: q.agendaUrlEn,
+        };
+        entry.count += 1;
+        entry.hashes.push(`${q.questionNo}:${q.contentHash}`);
+        updatedUpcomingByDate.set(q.meetingDate, entry);
+      }
+    }
+
+    if (!isBootstrap) {
+      for (const [mDate, info] of updatedUpcomingByDate.entries()) {
+        const dateHash = crypto
+          .createHash("sha256")
+          .update(info.hashes.sort().join("|"))
+          .digest("hex")
+          .slice(0, 12);
+        const ok = await recordEvent({
+          eventType: "QUESTIONS_UPDATED",
+          severity: "high",
+          titleEn: `Council questions updated — ${mDate} (${info.count} question${info.count === 1 ? "" : "s"})`,
+          titleTc: `立法會會議質詢已更新 — ${mDate}（${info.count} 項質詢）`,
+          summaryEn: `${info.count} tabled oral/written question(s) published or revised for the ${mDate} Council meeting`,
+          summaryTc: `${mDate} 立法會會議已有 ${info.count} 項口頭／書面質詢上載或更新`,
+          linkUrl: info.linkUrl,
+          committeeNameEn: "Council Meeting",
+          committeeNameTc: "立法會會議",
+          fingerprint: `q_up:${mDate}:${dateHash}`,
+        });
+        if (ok) eventsRecorded += 1;
+      }
+    }
 
     if (isBootstrap) {
       const ok = await recordEvent({
